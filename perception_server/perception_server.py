@@ -27,8 +27,8 @@ app = FastAPI(
 model = None
 device = None
 
-# 距離校正係數 (TODO: 用 Go2 實拍校正)
-SCALE_FACTOR = 1.0
+# 距離校正係數 (Go2 廣角鏡頭校正 - 2025/12/15)
+SCALE_FACTOR = 0.60
 
 
 @app.on_event("startup")
