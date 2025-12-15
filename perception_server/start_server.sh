@@ -7,6 +7,6 @@ echo "🚀 啟動 Perception Server..."
 cd "$(dirname "$0")"
 
 # 啟動 uvicorn
-uvicorn perception_server:app --host 0.0.0.0 --port 8000 --reload
+uvicorn perception_server:app --host 0.0.0.0 --port 8050 --reload
 
 echo "💡 Server 已停止"
