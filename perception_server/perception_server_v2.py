@@ -41,10 +41,77 @@ device = None
 # ======================
 # 校正參數 (Go2 廣角鏡頭)
 # ======================
-SCALE_FACTOR = 0.60      # DA3 距離校正
+SCALE_FACTOR = 0.60      # DA3 距離校正 (舊版，保留相容性)
 IMAGE_WIDTH = 640        # 畫面寬度
 LEFT_THRESHOLD = 213     # 左側區域 (< 1/3)
 RIGHT_THRESHOLD = 427    # 右側區域 (> 2/3)
+
+# ======================
+# 分段距離校正參數
+# ======================
+# 分段閾值 (基於 DA3 原始輸出範圍)
+# 測試數據：15cm->0.23, 30cm->0.45, 45cm->0.68, 1m->4.43
+THRESHOLD_NEAR = 0.80   # 近-中距離邊界 (DA3 原始值 ~0.75m)
+THRESHOLD_MID = 3.00    # 中-遠距離邊界 (DA3 原始值)
+
+# 各區段校正係數 (根據實測計算)
+SCALE_NEAR = 0.66       # 近距離 (<0.8m DA3): 0.15/0.23 ≈ 0.65
+SCALE_MID = 0.23        # 中距離 (0.8-3m DA3): 1.00/4.43 ≈ 0.23
+SCALE_FAR = 0.20        # 遠距離 (>3m DA3): 保守估計
+
+# 過渡平滑寬度
+BLEND_WIDTH = 0.20      # 20cm 過渡區避免突兀跳變
+
+# 功能開關
+USE_PIECEWISE_CORRECTION = True  # 設為 False 可回退到舊版
+
+
+def piecewise_distance_correction(raw_depth: float) -> float:
+    """
+    分段非線性距離校正
+
+    根據測試數據設計的三段式校正:
+    - 近距離 (DA3 < 0.75m): × 0.90 → 實際 0-0.7m
+    - 中距離 (DA3 0.75-4.5m): × 0.38 → 實際 0.3-1.7m
+    - 遠距離 (DA3 > 4.5m): × 0.28 → 實際 > 1.35m
+
+    Args:
+        raw_depth: DA3 模型原始輸出距離 (公尺)
+
+    Returns:
+        校正後的距離 (公尺)
+    """
+    if raw_depth < THRESHOLD_NEAR:
+        # 近距離區域
+        return raw_depth * SCALE_NEAR
+
+    elif raw_depth < THRESHOLD_NEAR + BLEND_WIDTH:
+        # 近-中過渡區 (平滑插值)
+        alpha = (raw_depth - THRESHOLD_NEAR) / BLEND_WIDTH
+        alpha = min(max(alpha, 0.0), 1.0)  # clip to [0, 1]
+        return raw_depth * (SCALE_NEAR * (1 - alpha) + SCALE_MID * alpha)
+
+    elif raw_depth < THRESHOLD_MID:
+        # 中距離區域
+        return raw_depth * SCALE_MID
+
+    elif raw_depth < THRESHOLD_MID + BLEND_WIDTH:
+        # 中-遠過渡區
+        alpha = (raw_depth - THRESHOLD_MID) / BLEND_WIDTH
+        alpha = min(max(alpha, 0.0), 1.0)
+        return raw_depth * (SCALE_MID * (1 - alpha) + SCALE_FAR * alpha)
+
+    else:
+        # 遠距離區域
+        return raw_depth * SCALE_FAR
+
+
+def get_corrected_distance(raw_depth: float) -> float:
+    """統一的距離校正接口 (支援向後兼容)"""
+    if USE_PIECEWISE_CORRECTION:
+        return piecewise_distance_correction(raw_depth)
+    else:
+        return raw_depth * SCALE_FACTOR  # 舊版線性校正
 
 
 @app.on_event("startup")
@@ -152,7 +219,8 @@ async def root():
 async def find_object(
     image: UploadFile = File(...),
     target: str = Form(default="water bottle"),
-    conf: float = Form(default=0.25)
+    conf: float = Form(default=0.25),
+    use_fallback: bool = Form(default=True)  # 新增: 沒找到時降低閾值重試
 ):
     """
     融合 YOLO + DA3 的物件搜尋 API
@@ -183,9 +251,18 @@ async def find_object(
         targets = [t.strip() for t in target.split(",")]
         yolo_model.set_classes(targets)
         
-        # 3. YOLO 偵測
+        # 3. YOLO 偵測 (兩階段)
         yolo_start = time.time()
-        results = yolo_model(pil_image, conf=conf)
+        
+        # 第一階段: 標準偵測
+        results = yolo_model(pil_image, conf=conf, iou=0.45)
+        detection_stage = "primary"
+        
+        # 第二階段: 若未找到且啟用 fallback，降低閾值重試
+        if use_fallback and len(results[0].boxes) == 0:
+            results = yolo_model(pil_image, conf=0.15, iou=0.60)  # 寬鬆 conf + 嚴格 IoU
+            detection_stage = "fallback"
+        
         yolo_time = (time.time() - yolo_start) * 1000
         
         # 4. DA3 深度估計
@@ -198,6 +275,7 @@ async def find_object(
         response = {
             "found": False,
             "target": target,
+            "detection_stage": detection_stage,  # 新增: 偵測階段
             "results": [],
             "timing_ms": {
                 "yolo": round(yolo_time, 1),
@@ -221,7 +299,7 @@ async def find_object(
                 # 從深度圖取得距離 (注意: depth_map[y, x] 不是 [x, y])
                 if 0 <= cy < depth_map.shape[0] and 0 <= cx < depth_map.shape[1]:
                     raw_distance = float(depth_map[cy, cx])
-                    distance = raw_distance * SCALE_FACTOR
+                    distance = get_corrected_distance(raw_distance)
                 else:
                     distance = -1  # 無法取得
                 
@@ -291,12 +369,12 @@ def analyze_depth_regions(depth_map: np.ndarray) -> dict:
     center_region = depth_map[:, w//3:2*w//3]
     right_region = depth_map[:, 2*w//3:]
     
-    left_dist = float(np.median(left_region)) * SCALE_FACTOR
-    center_dist = float(np.median(center_region)) * SCALE_FACTOR
-    right_dist = float(np.median(right_region)) * SCALE_FACTOR
+    left_dist = get_corrected_distance(float(np.median(left_region)))
+    center_dist = get_corrected_distance(float(np.median(center_region)))
+    right_dist = get_corrected_distance(float(np.median(right_region)))
     
     center_lower = depth_map[h//2:, w//3:2*w//3]
-    center_front = float(np.percentile(center_lower, 25)) * SCALE_FACTOR
+    center_front = get_corrected_distance(float(np.percentile(center_lower, 25)))
     
     return {
         "left_m": round(left_dist, 2),
